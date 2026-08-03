@@ -36,7 +36,7 @@ func NewMockRouting(h host.Host, tab *mockRoutingTable) *mockRouting {
 	return &mockRouting{h: h, tab: tab}
 }
 
-func (m *mockRouting) Provide(ctx context.Context, cid cid.Cid, bcast bool) error {
+func (m *mockRouting) Provide(_ context.Context, cid cid.Cid, _ bool) error {
 	m.tab.mx.Lock()
 	defer m.tab.mx.Unlock()
 
@@ -51,7 +51,7 @@ func (m *mockRouting) Provide(ctx context.Context, cid cid.Cid, bcast bool) erro
 	return nil
 }
 
-func (m *mockRouting) FindProvidersAsync(ctx context.Context, cid cid.Cid, limit int) <-chan peer.AddrInfo {
+func (m *mockRouting) FindProvidersAsync(ctx context.Context, cid cid.Cid, _ int) <-chan peer.AddrInfo {
 	ch := make(chan peer.AddrInfo)
 	go func() {
 		defer close(ch)
@@ -76,8 +76,7 @@ func (m *mockRouting) FindProvidersAsync(ctx context.Context, cid cid.Cid, limit
 }
 
 func TestRoutingDiscovery(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	h1 := bhost.NewBlankHost(swarmt.GenSwarm(t))
 	h2 := bhost.NewBlankHost(swarmt.GenSwarm(t))
@@ -110,8 +109,7 @@ func TestRoutingDiscovery(t *testing.T) {
 }
 
 func TestDiscoveryRouting(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	h1 := bhost.NewBlankHost(swarmt.GenSwarm(t))
 	h2 := bhost.NewBlankHost(swarmt.GenSwarm(t))

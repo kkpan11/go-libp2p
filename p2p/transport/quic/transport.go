@@ -19,7 +19,7 @@ import (
 	p2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
 
-	logging "github.com/ipfs/go-log/v2"
+	logging "github.com/libp2p/go-libp2p/gologshim"
 	ma "github.com/multiformats/go-multiaddr"
 	mafmt "github.com/multiformats/go-multiaddr-fmt"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -33,8 +33,6 @@ var log = logging.Logger("quic-transport")
 var ErrHolePunching = errors.New("hole punching attempted; no active dial")
 
 var HolePunchTimeout = 5 * time.Second
-
-const errorCodeConnectionGating = 0x47415445 // GATE in ASCII
 
 // The Transport implements the tpt.Transport interface for QUIC connections.
 type transport struct {
@@ -52,7 +50,7 @@ type transport struct {
 	rnd   rand.Rand
 
 	connMx sync.Mutex
-	conns  map[quic.Connection]*conn
+	conns  map[*quic.Conn]*conn
 
 	listenersMu sync.Mutex
 	// map of UDPAddr as string to a virtualListeners
@@ -72,16 +70,22 @@ type activeHolePunch struct {
 }
 
 // NewTransport creates a new QUIC transport
-func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr network.ResourceManager) (tpt.Transport, error) {
+func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr network.ResourceManager, opts ...Option) (tpt.Transport, error) {
 	if len(psk) > 0 {
 		log.Error("QUIC doesn't support private networks yet.")
 		return nil, errors.New("QUIC doesn't support private networks yet")
+	}
+	var cfg transportConfig
+	for _, opt := range opts {
+		if err := opt(&cfg); err != nil {
+			return nil, err
+		}
 	}
 	localPeer, err := peer.IDFromPrivateKey(key)
 	if err != nil {
 		return nil, err
 	}
-	identity, err := p2ptls.NewIdentity(key)
+	identity, err := p2ptls.NewIdentity(key, cfg.tlsIdentityOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +101,7 @@ func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.P
 		connManager:  connManager,
 		gater:        gater,
 		rcmgr:        rcmgr,
-		conns:        make(map[quic.Connection]*conn),
+		conns:        make(map[*quic.Conn]*conn),
 		holePunching: make(map[holePunchKey]*activeHolePunch),
 		rnd:          *rand.New(rand.NewSource(time.Now().UnixNano())),
 
@@ -117,7 +121,7 @@ func (t *transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (_c
 
 	scope, err := t.rcmgr.OpenConnection(network.DirOutbound, false, raddr)
 	if err != nil {
-		log.Debugw("resource manager blocked outgoing connection", "peer", p, "addr", raddr, "error", err)
+		log.Debug("resource manager blocked outgoing connection", "peer", p, "addr", raddr, "err", err)
 		return nil, err
 	}
 
@@ -131,11 +135,12 @@ func (t *transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (_c
 
 func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p peer.ID, scope network.ConnManagementScope) (tpt.CapableConn, error) {
 	if err := scope.SetPeer(p); err != nil {
-		log.Debugw("resource manager blocked outgoing connection for peer", "peer", p, "addr", raddr, "error", err)
+		log.Debug("resource manager blocked outgoing connection for peer", "peer", p, "addr", raddr, "err", err)
 		return nil, err
 	}
 
 	tlsConf, keyCh := t.identity.ConfigForPeer(p)
+	ctx = quicreuse.WithAssociation(ctx, t)
 	pconn, err := t.connManager.DialQUIC(ctx, raddr, tlsConf, t.allowWindowIncrease)
 	if err != nil {
 		return nil, err
@@ -168,20 +173,20 @@ func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p pee
 		remoteMultiaddr: raddr,
 	}
 	if t.gater != nil && !t.gater.InterceptSecured(network.DirOutbound, p, c) {
-		pconn.CloseWithError(errorCodeConnectionGating, "connection gated")
+		pconn.CloseWithError(quic.ApplicationErrorCode(network.ConnGated), "connection gated")
 		return nil, fmt.Errorf("secured connection gated")
 	}
 	t.addConn(pconn, c)
 	return c, nil
 }
 
-func (t *transport) addConn(conn quic.Connection, c *conn) {
+func (t *transport) addConn(conn *quic.Conn, c *conn) {
 	t.connMx.Lock()
 	t.conns[conn] = c
 	t.connMx.Unlock()
 }
 
-func (t *transport) removeConn(conn quic.Connection) {
+func (t *transport) removeConn(conn *quic.Conn) {
 	t.connMx.Lock()
 	delete(t.conns, conn)
 	t.connMx.Unlock()
@@ -196,7 +201,7 @@ func (t *transport) holePunch(ctx context.Context, raddr ma.Multiaddr, p peer.ID
 	if err != nil {
 		return nil, err
 	}
-	tr, err := t.connManager.TransportForDial(network, addr)
+	tr, err := t.connManager.TransportWithAssociationForDial(t, network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -238,10 +243,9 @@ loop:
 			break
 		}
 
-		maxSleep := 10 * (i + 1) * (i + 1) // in ms
-		if maxSleep > 200 {
-			maxSleep = 200
-		}
+		maxSleep := min(
+			// in ms
+			10*(i+1)*(i+1), 200)
 		d := 10*time.Millisecond + time.Duration(rand.Intn(maxSleep))*time.Millisecond
 		if timer == nil {
 			timer = time.NewTimer(d)
@@ -313,7 +317,7 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 			return nil, fmt.Errorf("can't listen on quic version %v, underlying listener doesn't support it", version)
 		}
 	} else {
-		ln, err := t.connManager.ListenQUIC(addr, &tlsConf, t.allowWindowIncrease)
+		ln, err := t.connManager.ListenQUICAndAssociate(t, addr, &tlsConf, t.allowWindowIncrease)
 		if err != nil {
 			return nil, err
 		}
@@ -326,7 +330,7 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 
 		acceptRunner = &acceptLoopRunner{
 			acceptSem: make(chan struct{}, 1),
-			muxer:     make(map[quic.VersionNumber]chan acceptVal),
+			muxer:     make(map[quic.Version]chan acceptVal),
 		}
 	}
 
@@ -345,7 +349,7 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 	return l, nil
 }
 
-func (t *transport) allowWindowIncrease(conn quic.Connection, size uint64) bool {
+func (t *transport) allowWindowIncrease(conn *quic.Conn, size uint64) bool {
 	// If the QUIC connection tries to increase the window before we've inserted it
 	// into our connections map (which we do right after dialing / accepting it),
 	// we have no way to account for that memory. This should be very rare.

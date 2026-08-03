@@ -11,7 +11,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	tu "github.com/libp2p/go-libp2p/core/test"
+
+	swarmt "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
 
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
@@ -26,6 +29,14 @@ type tconn struct {
 }
 
 func (c *tconn) Close() error {
+	atomic.StoreUint32(&c.closed, 1)
+	if c.disconnectNotify != nil {
+		c.disconnectNotify(nil, c)
+	}
+	return nil
+}
+
+func (c *tconn) CloseWithError(_ network.ConnErrorCode) error {
 	atomic.StoreUint32(&c.closed, 1)
 	if c.disconnectNotify != nil {
 		c.disconnectNotify(nil, c)
@@ -133,8 +144,8 @@ func TestConnTrimming(t *testing.T) {
 	defer cm.Close()
 	not := cm.Notifee()
 
-	var conns []network.Conn
-	for i := 0; i < 300; i++ {
+	conns := make([]network.Conn, 0, 300)
+	for range 300 {
 		rc := randConn(t, nil)
 		conns = append(conns, rc)
 		not.Connected(nil, rc)
@@ -146,7 +157,7 @@ func TestConnTrimming(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		cm.TagPeer(conns[i].RemotePeer(), "foo", 10)
 	}
 
@@ -154,7 +165,7 @@ func TestConnTrimming(t *testing.T) {
 
 	cm.TrimOpenConns(context.Background())
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		c := conns[i]
 		if c.(*tconn).isClosed() {
 			t.Fatal("these shouldnt be closed")
@@ -169,7 +180,7 @@ func TestConnTrimming(t *testing.T) {
 func TestConnsToClose(t *testing.T) {
 	addConns := func(cm *BasicConnMgr, n int) {
 		not := cm.Notifee()
-		for i := 0; i < n; i++ {
+		for range n {
 			conn := randConn(t, nil)
 			not.Connected(nil, conn)
 		}
@@ -419,7 +430,7 @@ func TestGracePeriod(t *testing.T) {
 
 	not := cm.Notifee()
 
-	var conns []network.Conn
+	conns := make([]network.Conn, 0, 31)
 
 	// Add a connection and wait the grace period.
 	{
@@ -435,7 +446,7 @@ func TestGracePeriod(t *testing.T) {
 	}
 
 	// quickly add 30 connections (sending us above the high watermark)
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		rc := randConn(t, not.Disconnected)
 		conns = append(conns, rc)
 		not.Connected(nil, rc)
@@ -473,10 +484,10 @@ func TestQuickBurstRespectsSilencePeriod(t *testing.T) {
 	defer cm.Close()
 	not := cm.Notifee()
 
-	var conns []network.Conn
+	conns := make([]network.Conn, 0, 30)
 
 	// quickly produce 30 connections (sending us above the high watermark)
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		rc := randConn(t, not.Disconnected)
 		conns = append(conns, rc)
 		not.Connected(nil, rc)
@@ -515,12 +526,12 @@ func TestPeerProtectionSingleTag(t *testing.T) {
 	}
 
 	// produce 20 connections with unique peers.
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		addConn(20)
 	}
 
 	// protect the first 5 peers.
-	var protected []network.Conn
+	protected := make([]network.Conn, 0, 5)
 	for _, c := range conns[0:5] {
 		cm.Protect(c.RemotePeer(), "global")
 		protected = append(protected, c)
@@ -541,7 +552,7 @@ func TestPeerProtectionSingleTag(t *testing.T) {
 	}
 
 	// add 5 more connection, sending the connection manager overboard.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		addConn(20)
 	}
 
@@ -567,7 +578,7 @@ func TestPeerProtectionSingleTag(t *testing.T) {
 	cm.Unprotect(protected[0].RemotePeer(), "global")
 
 	// add 2 more connections, sending the connection manager overboard again.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		addConn(20)
 	}
 
@@ -590,8 +601,8 @@ func TestPeerProtectionMultipleTags(t *testing.T) {
 	not := cm.Notifee()
 
 	// produce 20 connections with unique peers.
-	var conns []network.Conn
-	for i := 0; i < 20; i++ {
+	conns := make([]network.Conn, 0, 20)
+	for range 20 {
 		rc := randConn(t, not.Disconnected)
 		conns = append(conns, rc)
 		not.Connected(nil, rc)
@@ -599,7 +610,7 @@ func TestPeerProtectionMultipleTags(t *testing.T) {
 	}
 
 	// protect the first 5 peers under two tags.
-	var protected []network.Conn
+	protected := make([]network.Conn, 0, 5)
 	for _, c := range conns[0:5] {
 		cm.Protect(c.RemotePeer(), "tag1")
 		cm.Protect(c.RemotePeer(), "tag2")
@@ -627,7 +638,7 @@ func TestPeerProtectionMultipleTags(t *testing.T) {
 	}
 
 	// add 2 more connections, sending the connection manager overboard again.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		rc := randConn(t, not.Disconnected)
 		not.Connected(nil, rc)
 		cm.TagPeer(rc.RemotePeer(), "test", 20)
@@ -646,7 +657,7 @@ func TestPeerProtectionMultipleTags(t *testing.T) {
 	cm.Unprotect(protected[0].RemotePeer(), "tag2")
 
 	// add 2 more connections, sending the connection manager overboard again.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		rc := randConn(t, not.Disconnected)
 		not.Connected(nil, rc)
 		cm.TagPeer(rc.RemotePeer(), "test", 20)
@@ -783,7 +794,7 @@ func TestConcurrentCleanupAndTagging(t *testing.T) {
 	require.NoError(t, err)
 	defer cm.Close()
 
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		conn := randConn(t, nil)
 		cm.TagPeer(conn.RemotePeer(), "test", 20)
 	}
@@ -793,19 +804,21 @@ type mockConn struct {
 	stats network.ConnStats
 }
 
-func (m mockConn) Close() error                                          { panic("implement me") }
-func (m mockConn) LocalPeer() peer.ID                                    { panic("implement me") }
-func (m mockConn) RemotePeer() peer.ID                                   { panic("implement me") }
-func (m mockConn) RemotePublicKey() crypto.PubKey                        { panic("implement me") }
-func (m mockConn) LocalMultiaddr() ma.Multiaddr                          { panic("implement me") }
-func (m mockConn) RemoteMultiaddr() ma.Multiaddr                         { panic("implement me") }
-func (m mockConn) Stat() network.ConnStats                               { return m.stats }
-func (m mockConn) ID() string                                            { panic("implement me") }
-func (m mockConn) IsClosed() bool                                        { panic("implement me") }
-func (m mockConn) NewStream(ctx context.Context) (network.Stream, error) { panic("implement me") }
-func (m mockConn) GetStreams() []network.Stream                          { panic("implement me") }
-func (m mockConn) Scope() network.ConnScope                              { panic("implement me") }
-func (m mockConn) ConnState() network.ConnectionState                    { return network.ConnectionState{} }
+func (m mockConn) Close() error                                        { panic("implement me") }
+func (m mockConn) CloseWithError(_ network.ConnErrorCode) error        { panic("implement me") }
+func (m mockConn) LocalPeer() peer.ID                                  { panic("implement me") }
+func (m mockConn) RemotePeer() peer.ID                                 { panic("implement me") }
+func (m mockConn) RemotePublicKey() crypto.PubKey                      { panic("implement me") }
+func (m mockConn) LocalMultiaddr() ma.Multiaddr                        { panic("implement me") }
+func (m mockConn) RemoteMultiaddr() ma.Multiaddr                       { panic("implement me") }
+func (m mockConn) Stat() network.ConnStats                             { return m.stats }
+func (m mockConn) ID() string                                          { panic("implement me") }
+func (m mockConn) IsClosed() bool                                      { panic("implement me") }
+func (m mockConn) NewStream(_ context.Context) (network.Stream, error) { panic("implement me") }
+func (m mockConn) GetStreams() []network.Stream                        { panic("implement me") }
+func (m mockConn) Scope() network.ConnScope                            { panic("implement me") }
+func (m mockConn) ConnState() network.ConnectionState                  { return network.ConnectionState{} }
+func (m mockConn) As(_ any) bool                                       { return false }
 
 func makeSegmentsWithPeerInfos(peerInfos peerInfos) *segments {
 	var s = func() *segments {
@@ -937,12 +950,12 @@ func TestSafeConcurrency(t *testing.T) {
 		const runs = 10
 		const concurrency = 10
 		var wg sync.WaitGroup
-		for i := 0; i < concurrency; i++ {
+		for range concurrency {
 			wg.Add(1)
 			go func() {
 				// add conns. This mimics new connection events
 				pis := peerInfos{p1, p2}
-				for i := 0; i < runs; i++ {
+				for i := range runs {
 					pi := pis[i%len(pis)]
 					s := ss.get(pi.id)
 					s.Lock()
@@ -955,7 +968,7 @@ func TestSafeConcurrency(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				pis := peerInfos{p1, p2}
-				for i := 0; i < runs; i++ {
+				for range runs {
 					pis.SortByValueAndStreams(ss, false)
 				}
 				wg.Done()
@@ -985,4 +998,80 @@ type testLimitGetter struct {
 
 func (g testLimitGetter) GetConnLimit() int {
 	return g.limit
+}
+
+func TestErrorCode(t *testing.T) {
+	sw1, sw2, sw3 := swarmt.GenSwarm(t), swarmt.GenSwarm(t), swarmt.GenSwarm(t)
+	defer sw1.Close()
+	defer sw2.Close()
+	defer sw3.Close()
+
+	cm, err := NewConnManager(1, 1, WithGracePeriod(0), WithSilencePeriod(10))
+	require.NoError(t, err)
+	defer cm.Close()
+
+	sw1.Peerstore().AddAddrs(sw2.LocalPeer(), sw2.ListenAddresses(), peerstore.PermanentAddrTTL)
+	sw1.Peerstore().AddAddrs(sw3.LocalPeer(), sw3.ListenAddresses(), peerstore.PermanentAddrTTL)
+
+	c12, err := sw1.DialPeer(context.Background(), sw2.LocalPeer())
+	require.NoError(t, err)
+
+	var c21 network.Conn
+	require.Eventually(t, func() bool {
+		conns := sw2.ConnsToPeer(sw1.LocalPeer())
+		if len(conns) == 0 {
+			return false
+		}
+		c21 = conns[0]
+		return true
+	}, 10*time.Second, 100*time.Millisecond)
+
+	c13, err := sw1.DialPeer(context.Background(), sw3.LocalPeer())
+	require.NoError(t, err)
+
+	var c31 network.Conn
+	require.Eventually(t, func() bool {
+		conns := sw3.ConnsToPeer(sw1.LocalPeer())
+		if len(conns) == 0 {
+			return false
+		}
+		c31 = conns[0]
+		return true
+	}, 10*time.Second, 100*time.Millisecond)
+
+	not := cm.Notifee()
+	not.Connected(sw1, c12)
+	not.Connected(sw1, c13)
+
+	cm.TrimOpenConns(context.Background())
+
+	require.True(t, c12.IsClosed() || c13.IsClosed())
+	var c, cr network.Conn
+	if c12.IsClosed() {
+		c = c12
+		require.Eventually(t, func() bool {
+			conns := sw2.ConnsToPeer(sw1.LocalPeer())
+			if len(conns) == 0 {
+				cr = c21
+				return true
+			}
+			return false
+		}, 5*time.Second, 100*time.Millisecond)
+	} else {
+		c = c13
+		require.Eventually(t, func() bool {
+			conns := sw3.ConnsToPeer(sw1.LocalPeer())
+			if len(conns) == 0 {
+				cr = c31
+				return true
+			}
+			return false
+		}, 5*time.Second, 100*time.Millisecond)
+	}
+
+	_, err = c.NewStream(context.Background())
+	require.ErrorIs(t, err, &network.ConnError{ErrorCode: network.ConnGarbageCollected, Remote: false})
+
+	_, err = cr.NewStream(context.Background())
+	require.ErrorIs(t, err, &network.ConnError{ErrorCode: network.ConnGarbageCollected, Remote: true})
 }

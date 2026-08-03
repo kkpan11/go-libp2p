@@ -16,7 +16,7 @@ import (
 
 var testData = []byte("this is some test data")
 
-func SubtestProtocols(t *testing.T, ta, tb transport.Transport, maddr ma.Multiaddr, peerA peer.ID) {
+func SubtestProtocols(t *testing.T, ta, tb transport.Transport, maddr ma.Multiaddr, _ peer.ID) {
 	rawIPAddr, _ := ma.NewMultiaddr("/ip4/1.2.3.4")
 	if ta.CanDial(rawIPAddr) || tb.CanDial(rawIPAddr) {
 		t.Error("nothing should be able to dial raw IP")
@@ -193,7 +193,7 @@ func SubtestPingPong(t *testing.T, ta, tb transport.Transport, maddr ma.Multiadd
 		}
 
 		var sWg sync.WaitGroup
-		for i := 0; i < streams; i++ {
+		for range streams {
 			s, err := connA.AcceptStream()
 			if err != nil {
 				t.Error(err)
@@ -241,7 +241,7 @@ func SubtestPingPong(t *testing.T, ta, tb transport.Transport, maddr ma.Multiadd
 		t.Fatal(err)
 	}
 
-	for i := 0; i < streams; i++ {
+	for i := range streams {
 		s, err := connB.OpenStream(context.Background())
 		if err != nil {
 			t.Error(err)
@@ -251,7 +251,7 @@ func SubtestPingPong(t *testing.T, ta, tb transport.Transport, maddr ma.Multiadd
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			data := []byte(fmt.Sprintf("%s - %d", testData, i))
+			data := fmt.Appendf(nil, "%s - %d", testData, i)
 			n, err := s.Write(data)
 			if err != nil {
 				s.Reset()

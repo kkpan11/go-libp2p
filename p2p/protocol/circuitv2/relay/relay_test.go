@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -29,8 +30,8 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, upgraders []transport.Upgrader) {
-	for i := 0; i < n; i++ {
+func getNetHosts(t *testing.T, _ context.Context, n int) (hosts []host.Host, upgraders []transport.Upgrader) {
+	for range n {
 		privk, pubk, err := crypto.GenerateKeyPair(crypto.Ed25519, 0)
 		if err != nil {
 			t.Fatal(err)
@@ -60,7 +61,7 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 		upgrader := swarmt.GenUpgrader(t, netw, nil)
 		upgraders = append(upgraders, upgrader)
 
-		tpt, err := tcp.NewTCPTransport(upgrader, nil)
+		tpt, err := tcp.NewTCPTransport(upgrader, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -96,8 +97,7 @@ func addTransport(t *testing.T, h host.Host, upgrader transport.Upgrader) {
 }
 
 func TestBasicRelay(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	hosts, upgraders := getNetHosts(t, ctx, 3)
 	addTransport(t, hosts[0], upgraders[0])
@@ -156,7 +156,7 @@ func TestBasicRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	for {
-		var e interface{}
+		var e any
 		select {
 		case e = <-sub.Out():
 		case <-time.After(2 * time.Second):
@@ -204,8 +204,7 @@ func TestBasicRelay(t *testing.T) {
 }
 
 func TestRelayLimitTime(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	hosts, upgraders := getNetHosts(t, ctx, 3)
 	addTransport(t, hosts[0], upgraders[0])
@@ -267,19 +266,18 @@ func TestRelayLimitTime(t *testing.T) {
 	if n > 0 {
 		t.Fatalf("expected to write 0 bytes, wrote %d", n)
 	}
-	if err != network.ErrReset {
+	if !errors.Is(err, network.ErrReset) {
 		t.Fatalf("expected reset, but got %s", err)
 	}
 
 	err = <-rch
-	if err != network.ErrReset {
+	if !errors.Is(err, network.ErrReset) {
 		t.Fatalf("expected reset, but got %s", err)
 	}
 }
 
 func TestRelayLimitData(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	hosts, upgraders := getNetHosts(t, ctx, 3)
 	addTransport(t, hosts[0], upgraders[0])
@@ -291,7 +289,7 @@ func TestRelayLimitData(t *testing.T) {
 		defer close(rch)
 
 		buf := make([]byte, 1024)
-		for i := 0; i < 3; i++ {
+		for range 3 {
 			n, err := s.Read(buf)
 			if err != nil {
 				t.Fatal(err)
@@ -300,7 +298,7 @@ func TestRelayLimitData(t *testing.T) {
 		}
 
 		n, err := s.Read(buf)
-		if err != network.ErrReset {
+		if !errors.Is(err, network.ErrReset) {
 			t.Fatalf("expected reset but got %s", err)
 		}
 		rch <- n
@@ -349,7 +347,7 @@ func TestRelayLimitData(t *testing.T) {
 	}
 
 	buf := make([]byte, 1024)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if _, err := rand.Read(buf); err != nil {
 			t.Fatal(err)
 		}

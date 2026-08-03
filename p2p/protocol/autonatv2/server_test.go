@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,28 +27,28 @@ import (
 
 func newTestRequests(addrs []ma.Multiaddr, sendDialData bool) (reqs []Request) {
 	reqs = make([]Request, len(addrs))
-	for i := 0; i < len(addrs); i++ {
+	for i := range addrs {
 		reqs[i] = Request{Addr: addrs[i], SendDialData: sendDialData}
 	}
 	return
 }
 
 func TestServerInvalidAddrsRejected(t *testing.T) {
-	c := newAutoNAT(t, nil, allowPrivateAddrs, withAmplificationAttackPreventionDialWait(0))
+	c := newAutoNAT(t, nil, AllowPrivateAddrs, withAmplificationAttackPreventionDialWait(0))
 	defer c.Close()
 	defer c.host.Close()
 
 	t.Run("no transport", func(t *testing.T) {
 		dialer := bhost.NewBlankHost(swarmt.GenSwarm(t, swarmt.OptDisableQUIC, swarmt.OptDisableTCP))
-		an := newAutoNAT(t, dialer, allowPrivateAddrs)
+		an := newAutoNAT(t, dialer, AllowPrivateAddrs)
 		defer an.Close()
 		defer an.host.Close()
 
 		idAndWait(t, c, an)
 
 		res, err := c.GetReachability(context.Background(), newTestRequests(c.host.Addrs(), true))
-		require.ErrorIs(t, err, ErrDialRefused)
-		require.Equal(t, Result{}, res)
+		require.NoError(t, err)
+		require.Equal(t, Result{AllAddrsRefused: true}, res)
 	})
 
 	t.Run("black holed addr", func(t *testing.T) {
@@ -64,8 +65,8 @@ func TestServerInvalidAddrsRejected(t *testing.T) {
 				Addr:         ma.StringCast("/ip4/1.2.3.4/udp/1234/quic-v1"),
 				SendDialData: true,
 			}})
-		require.ErrorIs(t, err, ErrDialRefused)
-		require.Equal(t, Result{}, res)
+		require.NoError(t, err)
+		require.Equal(t, Result{AllAddrsRefused: true}, res)
 	})
 
 	t.Run("private addrs", func(t *testing.T) {
@@ -76,8 +77,8 @@ func TestServerInvalidAddrsRejected(t *testing.T) {
 		idAndWait(t, c, an)
 
 		res, err := c.GetReachability(context.Background(), newTestRequests(c.host.Addrs(), true))
-		require.ErrorIs(t, err, ErrDialRefused)
-		require.Equal(t, Result{}, res)
+		require.NoError(t, err)
+		require.Equal(t, Result{AllAddrsRefused: true}, res)
 	})
 
 	t.Run("relay addrs", func(t *testing.T) {
@@ -89,8 +90,8 @@ func TestServerInvalidAddrsRejected(t *testing.T) {
 
 		res, err := c.GetReachability(context.Background(), newTestRequests(
 			[]ma.Multiaddr{ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/tcp/1/p2p/%s/p2p-circuit/p2p/%s", c.host.ID(), c.srv.dialerHost.ID()))}, true))
-		require.ErrorIs(t, err, ErrDialRefused)
-		require.Equal(t, Result{}, res)
+		require.NoError(t, err)
+		require.Equal(t, Result{AllAddrsRefused: true}, res)
 	})
 
 	t.Run("no addr", func(t *testing.T) {
@@ -100,12 +101,12 @@ func TestServerInvalidAddrsRejected(t *testing.T) {
 
 	t.Run("too many address", func(t *testing.T) {
 		dialer := bhost.NewBlankHost(swarmt.GenSwarm(t, swarmt.OptDisableTCP))
-		an := newAutoNAT(t, dialer, allowPrivateAddrs)
+		an := newAutoNAT(t, dialer, AllowPrivateAddrs)
 		defer an.Close()
 		defer an.host.Close()
 
 		var addrs []ma.Multiaddr
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			addrs = append(addrs, ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 2000+i)))
 		}
 		addrs = append(addrs, c.host.Addrs()...)
@@ -113,18 +114,18 @@ func TestServerInvalidAddrsRejected(t *testing.T) {
 		idAndWait(t, c, an)
 
 		res, err := c.GetReachability(context.Background(), newTestRequests(addrs, true))
-		require.ErrorIs(t, err, ErrDialRefused)
-		require.Equal(t, Result{}, res)
+		require.NoError(t, err)
+		require.Equal(t, Result{AllAddrsRefused: true}, res)
 	})
 
 	t.Run("msg too large", func(t *testing.T) {
 		dialer := bhost.NewBlankHost(swarmt.GenSwarm(t, swarmt.OptDisableTCP))
-		an := newAutoNAT(t, dialer, allowPrivateAddrs)
+		an := newAutoNAT(t, dialer, AllowPrivateAddrs)
 		defer an.Close()
 		defer an.host.Close()
 
 		var addrs []ma.Multiaddr
-		for i := 0; i < 10000; i++ {
+		for i := range 10000 {
 			addrs = append(addrs, ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 2000+i)))
 		}
 		addrs = append(addrs, c.host.Addrs()...)
@@ -135,27 +136,26 @@ func TestServerInvalidAddrsRejected(t *testing.T) {
 		require.ErrorIs(t, err, network.ErrReset)
 		require.Equal(t, Result{}, res)
 	})
-
 }
 
 func TestServerDataRequest(t *testing.T) {
 	// server will skip all tcp addresses
 	dialer := bhost.NewBlankHost(swarmt.GenSwarm(t, swarmt.OptDisableTCP))
 	// ask for dial data for quic address
-	an := newAutoNAT(t, dialer, allowPrivateAddrs, withDataRequestPolicy(
-		func(s network.Stream, dialAddr ma.Multiaddr) bool {
+	an := newAutoNAT(t, dialer, AllowPrivateAddrs, withDataRequestPolicy(
+		func(_, dialAddr ma.Multiaddr) bool {
 			if _, err := dialAddr.ValueForProtocol(ma.P_QUIC_V1); err == nil {
 				return true
 			}
 			return false
 		}),
-		WithServerRateLimit(10, 10, 10),
+		WithServerRateLimit(10, 10, 10, 2),
 		withAmplificationAttackPreventionDialWait(0),
 	)
 	defer an.Close()
 	defer an.host.Close()
 
-	c := newAutoNAT(t, nil, allowPrivateAddrs)
+	c := newAutoNAT(t, nil, AllowPrivateAddrs)
 	defer c.Close()
 	defer c.host.Close()
 
@@ -178,8 +178,8 @@ func TestServerDataRequest(t *testing.T) {
 
 	require.Equal(t, Result{
 		Addr:         quicAddr,
+		Idx:          0,
 		Reachability: network.ReachabilityPublic,
-		Status:       pb.DialStatus_OK,
 	}, res)
 
 	// Small messages should be rejected for dial data
@@ -187,24 +187,89 @@ func TestServerDataRequest(t *testing.T) {
 	_, err = c.GetReachability(context.Background(), []Request{{Addr: quicAddr, SendDialData: true}, {Addr: tcpAddr}})
 	require.Error(t, err)
 }
+
+func TestServerMaxConcurrentRequestsPerPeer(t *testing.T) {
+	const concurrentRequests = 5
+
+	stallChan := make(chan struct{})
+	an := newAutoNAT(t, nil, AllowPrivateAddrs, withDataRequestPolicy(
+		// stall all allowed requests
+		func(_, _ ma.Multiaddr) bool {
+			<-stallChan
+			return true
+		}),
+		WithServerRateLimit(10, 10, 10, concurrentRequests),
+		withAmplificationAttackPreventionDialWait(0),
+	)
+	defer an.Close()
+	defer an.host.Close()
+
+	// server will skip all tcp addresses
+	dialer := bhost.NewBlankHost(swarmt.GenSwarm(t, swarmt.OptDisableTCP))
+	c := newAutoNAT(t, dialer, AllowPrivateAddrs)
+	defer c.Close()
+	defer c.host.Close()
+
+	idAndWait(t, c, an)
+
+	errChan := make(chan error)
+	const n = 10
+	// num concurrentRequests will stall and n will fail
+	for range concurrentRequests + n {
+		go func() {
+			_, err := c.GetReachability(context.Background(), []Request{{Addr: c.host.Addrs()[0], SendDialData: false}})
+			errChan <- err
+		}()
+	}
+
+	// check N failures
+	for i := range n {
+		select {
+		case err := <-errChan:
+			require.Error(t, err)
+			if !strings.Contains(err.Error(), "stream reset") && !strings.Contains(err.Error(), "E_REQUEST_REJECTED") {
+				t.Fatalf("invalid error: %s expected: stream reset or E_REQUEST_REJECTED", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("expected %d errors: got: %d", n, i)
+		}
+	}
+
+	close(stallChan) // complete stalled requests
+	// check concurrentRequests failures, as we won't send dial data
+	for i := range concurrentRequests {
+		select {
+		case err := <-errChan:
+			require.Error(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("expected %d errors: got: %d", concurrentRequests, i)
+		}
+	}
+	select {
+	case err := <-errChan:
+		t.Fatalf("expected no more errors: got: %v", err)
+	default:
+	}
+}
+
 func TestServerDataRequestJitter(t *testing.T) {
 	// server will skip all tcp addresses
 	dialer := bhost.NewBlankHost(swarmt.GenSwarm(t, swarmt.OptDisableTCP))
 	// ask for dial data for quic address
-	an := newAutoNAT(t, dialer, allowPrivateAddrs, withDataRequestPolicy(
-		func(s network.Stream, dialAddr ma.Multiaddr) bool {
+	an := newAutoNAT(t, dialer, AllowPrivateAddrs, withDataRequestPolicy(
+		func(_, dialAddr ma.Multiaddr) bool {
 			if _, err := dialAddr.ValueForProtocol(ma.P_QUIC_V1); err == nil {
 				return true
 			}
 			return false
 		}),
-		WithServerRateLimit(10, 10, 10),
+		WithServerRateLimit(10, 10, 10, 2),
 		withAmplificationAttackPreventionDialWait(5*time.Second),
 	)
 	defer an.Close()
 	defer an.host.Close()
 
-	c := newAutoNAT(t, nil, allowPrivateAddrs)
+	c := newAutoNAT(t, nil, AllowPrivateAddrs)
 	defer c.Close()
 	defer c.host.Close()
 
@@ -219,7 +284,7 @@ func TestServerDataRequestJitter(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		st := time.Now()
 		res, err := c.GetReachability(context.Background(), []Request{{Addr: quicAddr, SendDialData: true}, {Addr: tcpAddr}})
 		took := time.Since(st)
@@ -227,8 +292,8 @@ func TestServerDataRequestJitter(t *testing.T) {
 
 		require.Equal(t, Result{
 			Addr:         quicAddr,
+			Idx:          0,
 			Reachability: network.ReachabilityPublic,
-			Status:       pb.DialStatus_OK,
 		}, res)
 		if took > 500*time.Millisecond {
 			return
@@ -238,11 +303,11 @@ func TestServerDataRequestJitter(t *testing.T) {
 }
 
 func TestServerDial(t *testing.T) {
-	an := newAutoNAT(t, nil, WithServerRateLimit(10, 10, 10), allowPrivateAddrs)
+	an := newAutoNAT(t, nil, WithServerRateLimit(10, 10, 10, 2), AllowPrivateAddrs)
 	defer an.Close()
 	defer an.host.Close()
 
-	c := newAutoNAT(t, nil, allowPrivateAddrs)
+	c := newAutoNAT(t, nil, AllowPrivateAddrs)
 	defer c.Close()
 	defer c.host.Close()
 
@@ -257,8 +322,8 @@ func TestServerDial(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, Result{
 			Addr:         unreachableAddr,
+			Idx:          0,
 			Reachability: network.ReachabilityPrivate,
-			Status:       pb.DialStatus_E_DIAL_ERROR,
 		}, res)
 	})
 
@@ -267,16 +332,16 @@ func TestServerDial(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, Result{
 			Addr:         hostAddrs[0],
+			Idx:          0,
 			Reachability: network.ReachabilityPublic,
-			Status:       pb.DialStatus_OK,
 		}, res)
 		for _, addr := range c.host.Addrs() {
 			res, err := c.GetReachability(context.Background(), newTestRequests([]ma.Multiaddr{addr}, false))
 			require.NoError(t, err)
 			require.Equal(t, Result{
 				Addr:         addr,
+				Idx:          0,
 				Reachability: network.ReachabilityPublic,
-				Status:       pb.DialStatus_OK,
 			}, res)
 		}
 	})
@@ -284,18 +349,14 @@ func TestServerDial(t *testing.T) {
 	t.Run("dialback error", func(t *testing.T) {
 		c.host.RemoveStreamHandler(DialBackProtocol)
 		res, err := c.GetReachability(context.Background(), newTestRequests(c.host.Addrs(), false))
-		require.NoError(t, err)
-		require.Equal(t, Result{
-			Addr:         hostAddrs[0],
-			Reachability: network.ReachabilityUnknown,
-			Status:       pb.DialStatus_E_DIAL_BACK_ERROR,
-		}, res)
+		require.ErrorContains(t, err, "dial-back stream error")
+		require.Equal(t, Result{}, res)
 	})
 }
 
 func TestRateLimiter(t *testing.T) {
 	cl := test.NewMockClock()
-	r := rateLimiter{RPM: 3, PerPeerRPM: 2, DialDataRPM: 1, now: cl.Now}
+	r := rateLimiter{RPM: 3, PerPeerRPM: 2, DialDataRPM: 1, now: cl.Now, MaxConcurrentRequestsPerPeer: 1}
 
 	require.True(t, r.Accept("peer1"))
 
@@ -335,29 +396,53 @@ func TestRateLimiter(t *testing.T) {
 	require.True(t, r.Accept("peer3"))
 }
 
+func TestRateLimiterConcurrentRequests(t *testing.T) {
+	const N = 5
+	const Peers = 5
+	for concurrentRequests := 1; concurrentRequests <= N; concurrentRequests++ {
+		cl := test.NewMockClock()
+		r := rateLimiter{RPM: 10 * Peers * N, PerPeerRPM: 10 * Peers * N, DialDataRPM: 10 * Peers * N, now: cl.Now, MaxConcurrentRequestsPerPeer: concurrentRequests}
+		for p := range Peers {
+			for i := 0; i < concurrentRequests; i++ {
+				require.True(t, r.Accept(peer.ID(fmt.Sprintf("peer-%d", p))))
+			}
+			require.False(t, r.Accept(peer.ID(fmt.Sprintf("peer-%d", p))))
+			// Now complete the requests
+			for i := 0; i < concurrentRequests; i++ {
+				r.CompleteRequest(peer.ID(fmt.Sprintf("peer-%d", p)))
+			}
+			// Now we should be able to accept new requests
+			for i := 0; i < concurrentRequests; i++ {
+				require.True(t, r.Accept(peer.ID(fmt.Sprintf("peer-%d", p))))
+			}
+			require.False(t, r.Accept(peer.ID(fmt.Sprintf("peer-%d", p))))
+		}
+	}
+}
+
 func TestRateLimiterStress(t *testing.T) {
 	cl := test.NewMockClock()
-	for i := 0; i < 10; i++ {
-		r := rateLimiter{RPM: 20 + i, PerPeerRPM: 10 + i, DialDataRPM: i, now: cl.Now}
+	for i := range 10 {
+		r := rateLimiter{RPM: 20 + i, PerPeerRPM: 10 + i, DialDataRPM: i, MaxConcurrentRequestsPerPeer: 1, now: cl.Now}
 
 		peers := make([]peer.ID, 10+i)
-		for i := 0; i < len(peers); i++ {
+		for i := range peers {
 			peers[i] = peer.ID(fmt.Sprintf("peer-%d", i))
 		}
 		peerSuccesses := make([]atomic.Int64, len(peers))
 		var success, dialDataSuccesses atomic.Int64
 		var wg sync.WaitGroup
-		for k := 0; k < 5; k++ {
+		for range 5 {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for i := 0; i < 2*60; i++ {
+				for range 2 * 60 {
 					for j, p := range peers {
 						if r.Accept(p) {
 							success.Add(1)
 							peerSuccesses[j].Add(1)
 						}
-						if r.AcceptDialDataRequest(p) {
+						if r.AcceptDialDataRequest() {
 							dialDataSuccesses.Add(1)
 						}
 						r.CompleteRequest(p)
@@ -386,7 +471,7 @@ func TestRateLimiterStress(t *testing.T) {
 		require.Equal(t, len(r.peerReqs), 1)
 		require.Equal(t, len(r.peerReqs[peers[0]]), 1)
 		require.Equal(t, len(r.dialDataReqs), 0)
-		require.Equal(t, len(r.ongoingReqs), 1)
+		require.Equal(t, len(r.inProgressReqs), 1)
 	}
 }
 
@@ -432,8 +517,86 @@ func TestReadDialData(t *testing.T) {
 	}
 }
 
+func TestServerDataRequestWithAmplificationAttackPrevention(t *testing.T) {
+	// server will skip all tcp addresses
+	dialer := bhost.NewBlankHost(swarmt.GenSwarm(t, swarmt.OptDisableTCP))
+	// ask for dial data for quic address
+	an := newAutoNAT(t, dialer, AllowPrivateAddrs,
+		WithServerRateLimit(10, 10, 10, 2),
+		withAmplificationAttackPreventionDialWait(0),
+	)
+	defer an.Close()
+	defer an.host.Close()
+
+	c := newAutoNAT(t, nil, AllowPrivateAddrs)
+	defer c.Close()
+	defer c.host.Close()
+
+	idAndWait(t, c, an)
+
+	err := c.host.Network().Listen(ma.StringCast("/ip6/::1/udp/0/quic-v1"))
+	if err != nil {
+		// machine doesn't have ipv6
+		t.Skip("skipping test because machine doesn't have ipv6")
+	}
+
+	var quicv4Addr ma.Multiaddr
+	var quicv6Addr ma.Multiaddr
+	for _, a := range c.host.Addrs() {
+		if _, err := a.ValueForProtocol(ma.P_QUIC_V1); err == nil {
+			if _, err := a.ValueForProtocol(ma.P_IP4); err == nil {
+				quicv4Addr = a
+			} else {
+				quicv6Addr = a
+			}
+		}
+	}
+	res, err := c.GetReachability(context.Background(), []Request{{Addr: quicv4Addr, SendDialData: false}})
+	require.NoError(t, err)
+	require.Equal(t, Result{
+		Addr:         quicv4Addr,
+		Idx:          0,
+		Reachability: network.ReachabilityPublic,
+	}, res)
+
+	// ipv6 address should require dial data
+	_, err = c.GetReachability(context.Background(), []Request{{Addr: quicv6Addr, SendDialData: false}})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid dial data request")
+	require.ErrorContains(t, err, "low priority addr")
+
+	// ipv6 address should work fine with dial data
+	res, err = c.GetReachability(context.Background(), []Request{{Addr: quicv6Addr, SendDialData: true}})
+	require.NoError(t, err)
+	require.Equal(t, Result{
+		Addr:         quicv6Addr,
+		Idx:          0,
+		Reachability: network.ReachabilityPublic,
+	}, res)
+}
+
+func TestDefaultAmplificationAttackPrevention(t *testing.T) {
+	q1 := ma.StringCast("/ip4/1.2.3.4/udp/1234/quic-v1")
+	q2 := ma.StringCast("/ip4/1.2.3.4/udp/1235/quic-v1")
+	t1 := ma.StringCast("/ip4/1.2.3.4/tcp/1234")
+
+	require.False(t, amplificationAttackPrevention(q1, q1))
+	require.False(t, amplificationAttackPrevention(q1, q2))
+	require.False(t, amplificationAttackPrevention(q1, t1))
+
+	t2 := ma.StringCast("/ip4/1.1.1.1/tcp/1235") // different IP
+	require.True(t, amplificationAttackPrevention(q2, t2))
+
+	// always ask dial data for dns addrs
+	d1 := ma.StringCast("/dns/localhost/udp/1/quic-v1")
+	d2 := ma.StringCast("/dnsaddr/libp2p.io/tcp/1")
+	require.True(t, amplificationAttackPrevention(d1, t1))
+	require.True(t, amplificationAttackPrevention(d2, t1))
+
+}
+
 func FuzzServerDialRequest(f *testing.F) {
-	a := newAutoNAT(f, nil, allowPrivateAddrs, WithServerRateLimit(math.MaxInt32, math.MaxInt32, math.MaxInt32))
+	a := newAutoNAT(f, nil, AllowPrivateAddrs, WithServerRateLimit(math.MaxInt32, math.MaxInt32, math.MaxInt32, 2))
 	c := newAutoNAT(f, nil)
 	idAndWait(f, c, a)
 	// reduce the streamTimeout before running this. TODO: fix this
@@ -461,7 +624,7 @@ func FuzzServerDialRequest(f *testing.F) {
 }
 
 func FuzzReadDialData(f *testing.F) {
-	f.Fuzz(func(t *testing.T, numBytes int, data []byte) {
+	f.Fuzz(func(_ *testing.T, numBytes int, data []byte) {
 		readDialData(numBytes, bytes.NewReader(data))
 	})
 }

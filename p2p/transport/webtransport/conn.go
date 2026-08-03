@@ -32,12 +32,12 @@ type conn struct {
 	session   *webtransport.Session
 
 	scope network.ConnManagementScope
-	qconn quic.Connection
+	qconn *quic.Conn
 }
 
 var _ tpt.CapableConn = &conn{}
 
-func newConn(tr *transport, sess *webtransport.Session, sconn *connSecurityMultiaddrs, scope network.ConnManagementScope, qconn quic.Connection) *conn {
+func newConn(tr *transport, sess *webtransport.Session, sconn *connSecurityMultiaddrs, scope network.ConnManagementScope, qconn *quic.Conn) *conn {
 	return &conn{
 		connSecurityMultiaddrs: sconn,
 		transport:              tr,
@@ -71,11 +71,15 @@ func (c *conn) allowWindowIncrease(size uint64) bool {
 // It must be called even if the peer closed the connection in order for
 // garbage collection to properly work in this package.
 func (c *conn) Close() error {
-	c.scope.Done()
-	c.transport.removeConn(c.session)
+	defer c.scope.Done()
+	c.transport.removeConn(c.qconn)
 	err := c.session.CloseWithError(0, "")
 	_ = c.qconn.CloseWithError(1, "")
 	return err
+}
+
+func (c *conn) CloseWithError(_ network.ConnErrorCode) error {
+	return c.Close()
 }
 
 func (c *conn) IsClosed() bool           { return c.session.Context().Err() != nil }
@@ -84,4 +88,16 @@ func (c *conn) Transport() tpt.Transport { return c.transport }
 
 func (c *conn) ConnState() network.ConnectionState {
 	return network.ConnectionState{Transport: "webtransport"}
+}
+
+func (c *conn) As(target any) bool {
+	if target, ok := target.(**quic.Conn); ok {
+		*target = c.qconn
+		return true
+	}
+	if target, ok := target.(**webtransport.Session); ok {
+		*target = c.session
+		return true
+	}
+	return false
 }

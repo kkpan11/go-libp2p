@@ -2,6 +2,7 @@ package testing
 
 import (
 	"crypto/rand"
+	"net"
 	"testing"
 	"time"
 
@@ -14,16 +15,18 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/sec"
-	"github.com/libp2p/go-libp2p/core/sec/insecure"
 	"github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoremem"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	tptu "github.com/libp2p/go-libp2p/p2p/net/upgrader"
+	"github.com/libp2p/go-libp2p/p2p/security/insecure"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
+	libp2pwebtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
 
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/quic-go/quic-go"
@@ -31,14 +34,16 @@ import (
 )
 
 type config struct {
-	disableReuseport bool
-	dialOnly         bool
-	disableTCP       bool
-	disableQUIC      bool
-	connectionGater  connmgr.ConnectionGater
-	sk               crypto.PrivKey
-	swarmOpts        []swarm.Option
-	eventBus         event.Bus
+	disableReuseport    bool
+	dialOnly            bool
+	disableTCP          bool
+	disableQUIC         bool
+	disableWebTransport bool
+	disableWebRTC       bool
+	connectionGater     connmgr.ConnectionGater
+	sk                  crypto.PrivKey
+	swarmOpts           []swarm.Option
+	eventBus            event.Bus
 	clock
 }
 
@@ -86,6 +91,16 @@ var OptDisableTCP Option = func(_ testing.TB, c *config) {
 // OptDisableQUIC disables QUIC.
 var OptDisableQUIC Option = func(_ testing.TB, c *config) {
 	c.disableQUIC = true
+}
+
+// OptDisableWebTransport disables WebTransport.
+var OptDisableWebTransport Option = func(_ testing.TB, c *config) {
+	c.disableWebTransport = true
+}
+
+// OptDisableWebRTC disables WebRTC.
+var OptDisableWebRTC Option = func(_ testing.TB, c *config) {
+	c.disableWebRTC = true
 }
 
 // OptConnGater configures the given connection gater on the test
@@ -164,7 +179,7 @@ func GenSwarm(t testing.TB, opts ...Option) *swarm.Swarm {
 		if cfg.disableReuseport {
 			tcpOpts = append(tcpOpts, tcp.DisableReuseport())
 		}
-		tcpTransport, err := tcp.NewTCPTransport(upgrader, nil, tcpOpts...)
+		tcpTransport, err := tcp.NewTCPTransport(upgrader, nil, nil, tcpOpts...)
 		require.NoError(t, err)
 		if err := s.AddTransport(tcpTransport); err != nil {
 			t.Fatal(err)
@@ -175,8 +190,9 @@ func GenSwarm(t testing.TB, opts ...Option) *swarm.Swarm {
 			}
 		}
 	}
+	var reuse *quicreuse.ConnManager
 	if !cfg.disableQUIC {
-		reuse, err := quicreuse.NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{})
+		reuse, err = quicreuse.NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -189,6 +205,43 @@ func GenSwarm(t testing.TB, opts ...Option) *swarm.Swarm {
 		}
 		if !cfg.dialOnly {
 			if err := s.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !cfg.disableWebTransport {
+		if reuse == nil {
+			reuse, err = quicreuse.NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		wtTransport, err := libp2pwebtransport.New(priv, nil, reuse, cfg.connectionGater, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AddTransport(wtTransport); err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.dialOnly {
+			if err := s.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !cfg.disableWebRTC {
+		listenUDPFn := func(network string, laddr *net.UDPAddr) (net.PacketConn, error) {
+			return net.ListenUDP(network, laddr)
+		}
+		wrtcTransport, err := libp2pwebrtc.New(priv, nil, cfg.connectionGater, nil, listenUDPFn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AddTransport(wrtcTransport); err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.dialOnly {
+			if err := s.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/webrtc-direct")); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -217,15 +270,15 @@ type MockConnectionGater struct {
 
 func DefaultMockConnectionGater() *MockConnectionGater {
 	m := &MockConnectionGater{}
-	m.Dial = func(p peer.ID, addr ma.Multiaddr) bool {
+	m.Dial = func(_ peer.ID, _ ma.Multiaddr) bool {
 		return true
 	}
 
-	m.PeerDial = func(p peer.ID) bool {
+	m.PeerDial = func(_ peer.ID) bool {
 		return true
 	}
 
-	m.Accept = func(c network.ConnMultiaddrs) bool {
+	m.Accept = func(_ network.ConnMultiaddrs) bool {
 		return true
 	}
 
@@ -233,7 +286,7 @@ func DefaultMockConnectionGater() *MockConnectionGater {
 		return true
 	}
 
-	m.Upgraded = func(c network.Conn) (bool, control.DisconnectReason) {
+	m.Upgraded = func(_ network.Conn) (bool, control.DisconnectReason) {
 		return true, 0
 	}
 

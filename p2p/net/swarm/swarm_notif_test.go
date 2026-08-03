@@ -2,14 +2,17 @@ package swarm_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	. "github.com/libp2p/go-libp2p/p2p/net/swarm"
 
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 
 	"github.com/stretchr/testify/require"
 )
@@ -79,11 +82,8 @@ func TestNotifications(t *testing.T) {
 
 			for _, c := range cons {
 				var found bool
-				for _, c2 := range expect {
-					if c == c2 {
-						found = true
-						break
-					}
+				if slices.Contains(expect, c) {
+					found = true
 				}
 
 				if !found {
@@ -93,11 +93,29 @@ func TestNotifications(t *testing.T) {
 		}
 	}
 
+	normalizeAddrs := func(a ma.Multiaddr, isLocal bool) ma.Multiaddr {
+		// remove certhashes
+		x, _ := ma.SplitFunc(a, func(c ma.Component) bool {
+			return c.Protocol().Code == ma.P_CERTHASH
+		})
+		// on local addrs, replace 0.0.0.0 with 127.0.0.1
+		if isLocal {
+			if manet.IsIPUnspecified(x) {
+				ip, rest := ma.SplitFirst(x)
+				if ip.Protocol().Code == ma.P_IP4 {
+					return ma.StringCast("/ip4/127.0.0.1").Encapsulate(rest)
+				} else {
+					return ma.StringCast("/ip6/::1").Encapsulate(rest)
+				}
+			}
+		}
+		return x
+	}
 	complement := func(c network.Conn) (*Swarm, *netNotifiee, *Conn) {
 		for i, s := range swarms {
 			for _, c2 := range s.Conns() {
-				if c.LocalMultiaddr().Equal(c2.RemoteMultiaddr()) &&
-					c2.LocalMultiaddr().Equal(c.RemoteMultiaddr()) {
+				if normalizeAddrs(c.LocalMultiaddr(), true).Equal(normalizeAddrs(c2.RemoteMultiaddr(), false)) &&
+					normalizeAddrs(c2.LocalMultiaddr(), true).Equal(normalizeAddrs(c.RemoteMultiaddr(), false)) {
 					return s, notifiees[i], c2.(*Conn)
 				}
 			}
@@ -152,15 +170,104 @@ func newNetNotifiee(buffer int) *netNotifiee {
 	}
 }
 
-func (nn *netNotifiee) Listen(n network.Network, a ma.Multiaddr) {
+func (nn *netNotifiee) Listen(_ network.Network, a ma.Multiaddr) {
 	nn.listen <- a
 }
-func (nn *netNotifiee) ListenClose(n network.Network, a ma.Multiaddr) {
+func (nn *netNotifiee) ListenClose(_ network.Network, a ma.Multiaddr) {
 	nn.listenClose <- a
 }
-func (nn *netNotifiee) Connected(n network.Network, v network.Conn) {
+func (nn *netNotifiee) Connected(_ network.Network, v network.Conn) {
 	nn.connected <- v
 }
-func (nn *netNotifiee) Disconnected(n network.Network, v network.Conn) {
+func (nn *netNotifiee) Disconnected(_ network.Network, v network.Conn) {
 	nn.disconnected <- v
+}
+
+// TestNotifications_CloseFromConnected verifies that closing a conn from
+// inside a Notifiee.Connected handler does not deadlock.
+func TestNotifications_CloseFromConnected(t *testing.T) {
+	const timeout = 5 * time.Second
+
+	swarms := makeSwarms(t, 2)
+	defer func() {
+		for _, s := range swarms {
+			require.NoError(t, s.Close())
+		}
+	}()
+
+	connected := make(chan network.Conn, 8)
+	disconnected := make(chan network.Conn, 8)
+	swarms[0].Notify(&network.NotifyBundle{
+		ConnectedF: func(_ network.Network, c network.Conn) {
+			_ = c.Close()
+			connected <- c
+		},
+		DisconnectedF: func(_ network.Network, c network.Conn) {
+			disconnected <- c
+		},
+	})
+
+	swarms[0].Peerstore().AddAddrs(swarms[1].LocalPeer(), swarms[1].ListenAddresses(), peerstore.TempAddrTTL)
+	// DialPeer may return an error because the conn is closed from the
+	// notification handler before dial bookkeeping completes; we don't care.
+	_, _ = swarms[0].DialPeer(context.Background(), swarms[1].LocalPeer())
+
+	var connectedConn network.Conn
+	select {
+	case connectedConn = <-connected:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for Connected notification")
+	}
+
+	select {
+	case dc := <-disconnected:
+		require.Same(t, connectedConn, dc, "Disconnected must fire for the same conn")
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for Disconnected notification")
+	}
+}
+
+// TestNotifications_CloseFromDisconnected verifies that calling Conn.Close
+// from inside a Notifiee.Disconnected handler does not deadlock. doClose
+// dispatches notifications in a goroutine, so closeOnce has already returned
+// by the time the handler runs and the re-entrant Close is a no-op.
+func TestNotifications_CloseFromDisconnected(t *testing.T) {
+	const timeout = 5 * time.Second
+
+	swarms := makeSwarms(t, 2)
+	defer func() {
+		for _, s := range swarms {
+			require.NoError(t, s.Close())
+		}
+	}()
+
+	connected := make(chan network.Conn, 8)
+	disconnected := make(chan network.Conn, 8)
+	swarms[0].Notify(&network.NotifyBundle{
+		ConnectedF: func(_ network.Network, c network.Conn) {
+			connected <- c
+		},
+		DisconnectedF: func(_ network.Network, c network.Conn) {
+			_ = c.Close()
+			disconnected <- c
+		},
+	})
+
+	swarms[0].Peerstore().AddAddrs(swarms[1].LocalPeer(), swarms[1].ListenAddresses(), peerstore.TempAddrTTL)
+	conn, err := swarms[0].DialPeer(context.Background(), swarms[1].LocalPeer())
+	require.NoError(t, err)
+
+	select {
+	case <-connected:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for Connected notification")
+	}
+
+	require.NoError(t, conn.Close())
+
+	select {
+	case <-disconnected:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for Disconnected notification (potential deadlock)")
+	}
 }

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"testing/quick"
@@ -84,7 +85,7 @@ func stripCertHashes(addr ma.Multiaddr) ma.Multiaddr {
 }
 
 // create a /certhash multiaddr component using the SHA256 of foobar
-func getCerthashComponent(t *testing.T, b []byte) ma.Multiaddr {
+func getCerthashComponent(t *testing.T, b []byte) *ma.Component {
 	t.Helper()
 	h := sha256.Sum256(b)
 	mh, err := multihash.Encode(h[:], multihash.SHA2_256)
@@ -133,7 +134,7 @@ func TestTransport(t *testing.T) {
 		require.NoError(t, err)
 		_, port, err := net.SplitHostPort(addr)
 		require.NoError(t, err)
-		require.Equal(t, ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/%s/quic-v1/webtransport", port)), conn.RemoteMultiaddr())
+		require.Equal(t, fmt.Sprintf("/ip4/127.0.0.1/udp/%s/quic-v1/webtransport", port), conn.RemoteMultiaddr().String())
 		addrChan <- conn.RemoteMultiaddr()
 	}()
 
@@ -145,7 +146,7 @@ func TestTransport(t *testing.T) {
 	data, err := io.ReadAll(str)
 	require.NoError(t, err)
 	require.Equal(t, "foobar", string(data))
-	require.Equal(t, <-addrChan, conn.LocalMultiaddr())
+	require.Equal(t, (<-addrChan).String(), conn.LocalMultiaddr().String())
 	require.NoError(t, conn.Close())
 	require.True(t, conn.IsClosed())
 }
@@ -179,7 +180,11 @@ func TestHashVerification(t *testing.T) {
 		var trErr *quic.TransportError
 		require.ErrorAs(t, err, &trErr)
 		require.Equal(t, quic.TransportErrorCode(0x12a), trErr.ErrorCode)
-		require.Contains(t, errors.Unwrap(trErr).Error(), "cert hash not found")
+		var errMismatchHash libp2pwebtransport.ErrCertHashMismatch
+		require.ErrorAs(t, err, &errMismatchHash)
+
+		e := sha256.Sum256([]byte("foobar"))
+		require.EqualValues(t, e[:], errMismatchHash.Actual[0])
 	})
 
 	t.Run("fails when adding a wrong hash", func(t *testing.T) {
@@ -377,7 +382,7 @@ func TestConnectionGaterDialing(t *testing.T) {
 	defer ln.Close()
 
 	connGater.EXPECT().InterceptSecured(network.DirOutbound, serverID, gomock.Any()).Do(func(_ network.Direction, _ peer.ID, addrs network.ConnMultiaddrs) {
-		require.Equal(t, stripCertHashes(ln.Multiaddr()), addrs.RemoteMultiaddr())
+		require.Equal(t, stripCertHashes(ln.Multiaddr()).String(), addrs.RemoteMultiaddr().String())
 	})
 	_, key := newIdentity(t)
 	cl, err := libp2pwebtransport.New(key, nil, newConnManager(t), connGater, &network.NullResourceManager{})
@@ -401,8 +406,8 @@ func TestConnectionGaterInterceptAccept(t *testing.T) {
 	defer ln.Close()
 
 	connGater.EXPECT().InterceptAccept(gomock.Any()).Do(func(addrs network.ConnMultiaddrs) {
-		require.Equal(t, stripCertHashes(ln.Multiaddr()), addrs.LocalMultiaddr())
-		require.NotEqual(t, stripCertHashes(ln.Multiaddr()), addrs.RemoteMultiaddr())
+		require.Equal(t, stripCertHashes(ln.Multiaddr()).String(), addrs.LocalMultiaddr().String())
+		require.NotEqual(t, stripCertHashes(ln.Multiaddr()).String(), addrs.RemoteMultiaddr().String())
 	})
 
 	_, key := newIdentity(t)
@@ -433,8 +438,8 @@ func TestConnectionGaterInterceptSecured(t *testing.T) {
 
 	connGater.EXPECT().InterceptAccept(gomock.Any()).Return(true)
 	connGater.EXPECT().InterceptSecured(network.DirInbound, clientID, gomock.Any()).Do(func(_ network.Direction, _ peer.ID, addrs network.ConnMultiaddrs) {
-		require.Equal(t, stripCertHashes(ln.Multiaddr()), addrs.LocalMultiaddr())
-		require.NotEqual(t, stripCertHashes(ln.Multiaddr()), addrs.RemoteMultiaddr())
+		require.Equal(t, stripCertHashes(ln.Multiaddr()).String(), addrs.LocalMultiaddr().String())
+		require.NotEqual(t, stripCertHashes(ln.Multiaddr()).String(), addrs.RemoteMultiaddr().String())
 	})
 	// The handshake will complete, but the server will immediately close the connection.
 	conn, err := cl.Dial(context.Background(), ln.Multiaddr(), serverID)
@@ -474,7 +479,7 @@ func TestAcceptQueueFilledUp(t *testing.T) {
 	const num = 16 + 1 // one more than the accept queue capacity
 	// Dial one more connection than the accept queue can hold.
 	errChan := make(chan error, num)
-	for i := 0; i < num; i++ {
+	for range num {
 		go func() {
 			conn, err := newConn()
 			if err != nil {
@@ -504,7 +509,7 @@ func TestAcceptQueueFilledUp(t *testing.T) {
 	var count int
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
-	for i := 0; i < 16; i++ {
+	for range 16 {
 		select {
 		case <-errChan:
 			count++
@@ -522,7 +527,7 @@ type reportingRcmgr struct {
 	report chan<- int
 }
 
-func (m *reportingRcmgr) OpenConnection(dir network.Direction, usefd bool, endpoint ma.Multiaddr) (network.ConnManagementScope, error) {
+func (m *reportingRcmgr) OpenConnection(_ network.Direction, _ bool, _ ma.Multiaddr) (network.ConnManagementScope, error) {
 	return &reportingScope{report: m.report}, nil
 }
 
@@ -534,6 +539,14 @@ type reportingScope struct {
 func (s *reportingScope) ReserveMemory(size int, _ uint8) error {
 	s.report <- size
 	return nil
+}
+
+func newUDPConnLocalhost(t testing.TB) *net.UDPConn {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	return conn
 }
 
 func TestFlowControlWindowIncrease(t *testing.T) {
@@ -569,11 +582,12 @@ func TestFlowControlWindowIncrease(t *testing.T) {
 		str.CloseWrite()
 	}()
 
-	proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-		RemoteAddr:  ln.Addr().String(),
-		DelayPacket: func(quicproxy.Direction, []byte) time.Duration { return rtt / 2 },
-	})
-	require.NoError(t, err)
+	proxy := quicproxy.Proxy{
+		Conn:        newUDPConnLocalhost(t),
+		ServerAddr:  ln.Addr().(*net.UDPAddr),
+		DelayPacket: func(quicproxy.Direction, net.Addr, net.Addr, []byte) time.Duration { return rtt / 2 },
+	}
+	require.NoError(t, proxy.Start())
 	defer proxy.Close()
 
 	_, clientKey := newIdentity(t)
@@ -584,16 +598,12 @@ func TestFlowControlWindowIncrease(t *testing.T) {
 	defer tr2.(io.Closer).Close()
 
 	var addr ma.Multiaddr
-	for _, comp := range ma.Split(ln.Multiaddr()) {
+	for _, comp := range ln.Multiaddr() {
 		if _, err := comp.ValueForProtocol(ma.P_UDP); err == nil {
-			addr = addr.Encapsulate(ma.StringCast(fmt.Sprintf("/udp/%d", proxy.LocalPort())))
+			addr = addr.Encapsulate(ma.StringCast(fmt.Sprintf("/udp/%d", proxy.LocalAddr().(*net.UDPAddr).Port)))
 			continue
 		}
-		if addr == nil {
-			addr = comp
-			continue
-		}
-		addr = addr.Encapsulate(comp)
+		addr = append(addr, comp)
 	}
 
 	conn, err := tr2.Dial(context.Background(), addr, serverID)
@@ -672,7 +682,7 @@ func serverSendsBackValidCert(t *testing.T, timeSinceUnixEpoch time.Duration, ke
 	conn, err := quic.DialAddr(context.Background(), l.Addr().String(), &tls.Config{
 		NextProtos:         []string{http3.NextProtoH3},
 		InsecureSkipVerify: true,
-		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			for _, c := range rawCerts {
 				cert, err := x509.ParseCertificate(c)
 				if err != nil {
@@ -770,11 +780,9 @@ func TestServerRotatesCertCorrectly(t *testing.T) {
 		var found bool
 		ma.ForEach(l.Multiaddr(), func(c ma.Component) bool {
 			if c.Protocol().Code == ma.P_CERTHASH {
-				for _, prevCerthash := range certhashes {
-					if c.Value() == prevCerthash {
-						found = true
-						return false
-					}
+				if slices.Contains(certhashes, c.Value()) {
+					found = true
+					return false
 				}
 			}
 			return true
@@ -803,7 +811,7 @@ func TestServerRotatesCertCorrectlyAfterSteps(t *testing.T) {
 
 	// Traverse various time boundaries and make sure we always keep a common certhash.
 	// e.g. certhash/A/certhash/B ... -> ... certhash/B/certhash/C ... -> ... certhash/C/certhash/D
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		cl.Add(24 * time.Hour)
 		tr, err := libp2pwebtransport.New(priv, nil, newConnManager(t), nil, &network.NullResourceManager{}, libp2pwebtransport.WithClock(cl))
 		require.NoError(t, err)
@@ -813,11 +821,9 @@ func TestServerRotatesCertCorrectlyAfterSteps(t *testing.T) {
 		var found bool
 		ma.ForEach(l.Multiaddr(), func(c ma.Component) bool {
 			if c.Protocol().Code == ma.P_CERTHASH {
-				for _, prevCerthash := range certhashes {
-					if prevCerthash == c.Value() {
-						found = true
-						return false
-					}
+				if slices.Contains(certhashes, c.Value()) {
+					found = true
+					return false
 				}
 			}
 			return true
@@ -845,10 +851,8 @@ func TestH3ConnClosed(t *testing.T) {
 		NextProtos:         []string{http3.NextProtoH3},
 	}, nil)
 	require.NoError(t, err)
-	rt := &http3.SingleDestinationRoundTripper{
-		Connection: conn,
-	}
-	rt.Start()
+	rt := &http3.Transport{}
+	rt.NewClientConn(conn)
 	require.Eventually(t, func() bool {
 		c := http.Client{
 			Transport: rt,

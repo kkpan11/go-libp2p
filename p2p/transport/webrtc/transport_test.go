@@ -221,6 +221,119 @@ func TestTransportWebRTC_CanListenSingle(t *testing.T) {
 	}
 }
 
+// TestTransportWebRTC_v2Dial runs the v2 (no SDP munging) dial flow end to end
+// against the standard listener: a full ICE + DTLS + Noise handshake plus a
+// two-way stream. The listener detects v2 from the ICE username fragment prefix
+// with no extra configuration.
+func TestTransportWebRTC_v2Dial(t *testing.T) {
+	tr, listeningPeer := getTransport(t)
+	tr1, connectingPeer := getTransport(t, WithDialerVersion(2))
+	listenMultiaddr := ma.StringCast("/ip4/127.0.0.1/udp/0/webrtc-direct")
+	listener, err := tr.Listen(listenMultiaddr)
+	require.NoError(t, err)
+	defer listener.Close()
+
+	streamChan := make(chan network.MuxedStream)
+	go func() {
+		conn, err := tr1.Dial(context.Background(), listener.Multiaddr(), listeningPeer)
+		assert.NoError(t, err)
+		t.Cleanup(func() { conn.Close() })
+		stream, err := conn.AcceptStream()
+		assert.NoError(t, err)
+		streamChan <- stream
+	}()
+
+	conn, err := listener.Accept()
+	require.NoError(t, err)
+	defer conn.Close()
+	require.Equal(t, connectingPeer, conn.RemotePeer())
+
+	stream, err := conn.OpenStream(context.Background())
+	require.NoError(t, err)
+	_, err = stream.Write([]byte("test"))
+	require.NoError(t, err)
+
+	var str network.MuxedStream
+	select {
+	case str = <-streamChan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream opening timed out")
+	}
+	buf := make([]byte, 100)
+	str.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := str.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "test", string(buf[:n]))
+}
+
+// TestTransportWebRTC_ListenerAcceptsBothVersions confirms a single listener
+// accepts both v1 and v2 dialers concurrently, dispatching on the ICE username
+// fragment prefix.
+func TestTransportWebRTC_ListenerAcceptsBothVersions(t *testing.T) {
+	tr, listeningPeer := getTransport(t)
+	listenMultiaddr := ma.StringCast("/ip4/127.0.0.1/udp/0/webrtc-direct")
+	listener, err := tr.Listen(listenMultiaddr)
+	require.NoError(t, err)
+	defer listener.Close()
+
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			client, connectingPeer := getTransport(t, WithDialerVersion(version))
+			done := make(chan struct{})
+			go func() {
+				conn, err := client.Dial(context.Background(), listener.Multiaddr(), listeningPeer)
+				assert.NoError(t, err)
+				if conn != nil {
+					t.Cleanup(func() { conn.Close() })
+				}
+				close(done)
+			}()
+
+			conn, err := listener.Accept()
+			require.NoError(t, err)
+			defer conn.Close()
+			require.Equal(t, connectingPeer, conn.RemotePeer())
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("dial timed out")
+			}
+		})
+	}
+}
+
+// WithDialerVersion requires an explicit, known version: it accepts 1/2 and
+// rejects 0 or unknown values rather than silently defaulting.
+func TestWithDialerVersion(t *testing.T) {
+	privKey, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	require.NoError(t, err)
+
+	for _, version := range []int{1, 2} {
+		_, err := New(privKey, nil, nil, &network.NullResourceManager{}, netListenUDP, WithDialerVersion(version))
+		require.NoError(t, err, "version %d should be accepted", version)
+	}
+
+	for _, version := range []int{0, 3} {
+		_, err := New(privKey, nil, nil, &network.NullResourceManager{}, netListenUDP, WithDialerVersion(version))
+		require.Error(t, err, "version %d should be rejected", version)
+	}
+}
+
+// An unknown dialer version is rejected at dial time, not treated as v1.
+func TestTransportWebRTC_DialerRejectsUnknownVersion(t *testing.T) {
+	tr, listeningPeer := getTransport(t)
+	listener, err := tr.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/webrtc-direct"))
+	require.NoError(t, err)
+	defer listener.Close()
+
+	client, _ := getTransport(t)
+	// set directly to simulate a future/unknown version (WithDialerVersion would
+	// reject it earlier); the dial must error rather than assume v1
+	client.dialerVersion = 3
+	_, err = client.Dial(context.Background(), listener.Multiaddr(), listeningPeer)
+	require.ErrorContains(t, err, "unsupported WebRTC Direct dialer version")
+}
+
 // WithListenerMaxInFlightConnections sets the maximum number of connections that are in-flight, i.e
 // they are being negotiated, or are waiting to be accepted.
 func WithListenerMaxInFlightConnections(m uint32) Option {
@@ -248,7 +361,7 @@ func TestTransportWebRTC_CanListenMultiple(t *testing.T) {
 
 	var wg sync.WaitGroup
 	go func() {
-		for i := 0; i < count; i++ {
+		for range count {
 			conn, err := listener.Accept()
 			assert.NoError(t, err)
 			assert.NotNil(t, conn)
@@ -258,7 +371,7 @@ func TestTransportWebRTC_CanListenMultiple(t *testing.T) {
 		cancel()
 	}()
 
-	for i := 0; i < count; i++ {
+	for range count {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -293,7 +406,7 @@ func TestTransportWebRTC_CanCreateSuccessiveConnections(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(count)
 	go func() {
-		for i := 0; i < count; i++ {
+		for range count {
 			ctr, _ := getTransport(t)
 			conn, err := ctr.Dial(context.Background(), listener.Multiaddr(), listeningPeer)
 			require.NoError(t, err)
@@ -303,7 +416,7 @@ func TestTransportWebRTC_CanCreateSuccessiveConnections(t *testing.T) {
 		}
 	}()
 
-	for i := 0; i < count; i++ {
+	for range count {
 		conn, err := listener.Accept()
 		require.NoError(t, err)
 		defer conn.Close()
@@ -427,7 +540,7 @@ func TestTransportWebRTC_DialerCanCreateStreamsMultiple(t *testing.T) {
 		defer lconn.Close()
 		var wg sync.WaitGroup
 		var doneStreams atomic.Int32
-		for i := 0; i < numListeners; i++ {
+		for range numListeners {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -456,7 +569,7 @@ func TestTransportWebRTC_DialerCanCreateStreamsMultiple(t *testing.T) {
 	var writerWG sync.WaitGroup
 	var cnt atomic.Int32
 	var streamsStarted atomic.Int32
-	for i := 0; i < numWriters; i++ {
+	for range numWriters {
 		writerWG.Add(1)
 		go func() {
 			defer writerWG.Done()
@@ -546,7 +659,7 @@ func TestTransportWebRTC_Deadline(t *testing.T) {
 		require.NoError(t, err)
 
 		stream.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-		largeBuffer := make([]byte, 2*1024*1024)
+		largeBuffer := make([]byte, 20*1024*1024)
 		_, err = stream.Write(largeBuffer)
 		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 
@@ -574,7 +687,7 @@ func TestTransportWebRTC_StreamWriteBufferContention(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { lconn.Close() })
 		require.Equal(t, connectingPeer, lconn.RemotePeer())
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			go func() {
 				defer wg.Done()
 				_, err := lconn.AcceptStream()
@@ -589,7 +702,7 @@ func TestTransportWebRTC_StreamWriteBufferContention(t *testing.T) {
 
 	errC := make(chan error)
 	// writers
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		go func() {
 			stream, err := conn.OpenStream(context.Background())
 			require.NoError(t, err)
@@ -776,6 +889,14 @@ func TestTransportWebRTC_PeerConnectionDTLSFailed(t *testing.T) {
 	require.Nil(t, conn)
 }
 
+func newUDPConnLocalhost(t testing.TB) *net.UDPConn {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	return conn
+}
+
 func TestConnectionTimeoutOnListener(t *testing.T) {
 	tr, listeningPeer := getTransport(t)
 	tr.peerConnectionTimeouts.Disconnect = 100 * time.Millisecond
@@ -788,11 +909,12 @@ func TestConnectionTimeoutOnListener(t *testing.T) {
 	defer ln.Close()
 
 	var drop atomic.Bool
-	proxy, err := quicproxy.NewQuicProxy("127.0.0.1:0", &quicproxy.Opts{
-		RemoteAddr: fmt.Sprintf("127.0.0.1:%d", ln.Addr().(*net.UDPAddr).Port),
-		DropPacket: func(quicproxy.Direction, []byte) bool { return drop.Load() },
-	})
-	require.NoError(t, err)
+	proxy := quicproxy.Proxy{
+		Conn:       newUDPConnLocalhost(t),
+		ServerAddr: ln.Addr().(*net.UDPAddr),
+		DropPacket: func(_ quicproxy.Direction, _, _ net.Addr, _ []byte) bool { return drop.Load() },
+	}
+	require.NoError(t, proxy.Start())
 	defer proxy.Close()
 
 	tr1, connectingPeer := getTransport(t)
@@ -867,7 +989,7 @@ func TestMaxInFlightRequests(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var success, fails atomic.Int32
-	for i := 0; i < count+1; i++ {
+	for range count + 1 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -889,23 +1011,22 @@ func TestMaxInFlightRequests(t *testing.T) {
 }
 
 func TestGenUfrag(t *testing.T) {
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		s := genUfrag()
 		require.True(t, strings.HasPrefix(s, "libp2p+webrtc+v1/"))
 	}
 }
 
 func TestManyConnections(t *testing.T) {
-	var listeners []tpt.Listener
-	var listenerPeerIDs []peer.ID
-
 	const numListeners = 5
 	const dialersPerListener = 5
 	const connsPerDialer = 10
 	errCh := make(chan error, 10*numListeners*dialersPerListener*connsPerDialer)
 	successCh := make(chan struct{}, 10*numListeners*dialersPerListener*connsPerDialer)
+	listeners := make([]tpt.Listener, 0, numListeners)
+	listenerPeerIDs := make([]peer.ID, 0, numListeners)
 
-	for i := 0; i < numListeners; i++ {
+	for range numListeners {
 		tr, lp := getTransport(t)
 		listenerPeerIDs = append(listenerPeerIDs, lp)
 		ln, err := tr.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/webrtc-direct"))
@@ -962,7 +1083,7 @@ func TestManyConnections(t *testing.T) {
 	}
 
 	runListener := func(ln tpt.Listener) {
-		for i := 0; i < dialersPerListener*connsPerDialer; i++ {
+		for range dialersPerListener * connsPerDialer {
 			conn, err := ln.Accept()
 			if err != nil {
 				t.Errorf("listener failed to accept conneciton: %s", err)
@@ -974,7 +1095,7 @@ func TestManyConnections(t *testing.T) {
 
 	runDialer := func(ln tpt.Listener, lp peer.ID) {
 		tp, _ := getTransport(t)
-		for i := 0; i < connsPerDialer; i++ {
+		for range connsPerDialer {
 			// We want to test for deadlocks, set a high timeout
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			conn, err := tp.Dial(ctx, ln.Multiaddr(), lp)
@@ -989,16 +1110,16 @@ func TestManyConnections(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < numListeners; i++ {
+	for i := range numListeners {
 		go runListener(listeners[i])
 	}
-	for i := 0; i < numListeners; i++ {
-		for j := 0; j < dialersPerListener; j++ {
+	for i := range numListeners {
+		for range dialersPerListener {
 			go runDialer(listeners[i], listenerPeerIDs[i])
 		}
 	}
 
-	for i := 0; i < numListeners*dialersPerListener*connsPerDialer; i++ {
+	for i := range numListeners * dialersPerListener * connsPerDialer {
 		select {
 		case <-successCh:
 			t.Log("completed conn: ", i)

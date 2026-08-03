@@ -24,12 +24,15 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	host "github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	libp2phttp "github.com/libp2p/go-libp2p/p2p/http"
+	httpauth "github.com/libp2p/go-libp2p/p2p/http/auth"
 	httpping "github.com/libp2p/go-libp2p/p2p/http/ping"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	ma "github.com/multiformats/go-multiaddr"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,7 +44,7 @@ func TestHTTPOverStreams(t *testing.T) {
 
 	httpHost := libp2phttp.Host{StreamHost: serverHost}
 
-	httpHost.SetHTTPHandler("/hello", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpHost.SetHTTPHandler("/hello", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("hello"))
 	}))
 
@@ -121,7 +124,7 @@ func TestHTTPOverStreamsContextAndClientTimeout(t *testing.T) {
 	require.NoError(t, err)
 
 	httpHost := libp2phttp.Host{StreamHost: serverHost}
-	httpHost.SetHTTPHandler("/hello/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpHost.SetHTTPHandler("/hello/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(2 * clientTimeout)
 		w.Write([]byte("hello"))
 	}))
@@ -177,7 +180,7 @@ func TestHTTPOverStreamsReturnsConnectionClose(t *testing.T) {
 
 	httpHost := libp2phttp.Host{StreamHost: serverHost}
 
-	httpHost.SetHTTPHandlerAtPath("/hello", "/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpHost.SetHTTPHandlerAtPath("/hello", "/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("hello"))
 	}))
 
@@ -219,7 +222,7 @@ func TestRoundTrippers(t *testing.T) {
 		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
 
-	httpHost.SetHTTPHandler("/hello", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpHost.SetHTTPHandler("/hello", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("hello"))
 	}))
 
@@ -237,7 +240,7 @@ func TestRoundTrippers(t *testing.T) {
 	}{
 		{
 			name: "HTTP preferred",
-			setupRoundTripper: func(t *testing.T, clientStreamHost host.Host, clientHTTPHost *libp2phttp.Host) http.RoundTripper {
+			setupRoundTripper: func(t *testing.T, _ host.Host, clientHTTPHost *libp2phttp.Host) http.RoundTripper {
 				rt, err := clientHTTPHost.NewConstrainedRoundTripper(peer.AddrInfo{
 					ID:    serverHost.ID(),
 					Addrs: serverMultiaddrs,
@@ -248,7 +251,7 @@ func TestRoundTrippers(t *testing.T) {
 		},
 		{
 			name: "HTTP first",
-			setupRoundTripper: func(t *testing.T, clientStreamHost host.Host, clientHTTPHost *libp2phttp.Host) http.RoundTripper {
+			setupRoundTripper: func(t *testing.T, _ host.Host, clientHTTPHost *libp2phttp.Host) http.RoundTripper {
 				rt, err := clientHTTPHost.NewConstrainedRoundTripper(peer.AddrInfo{
 					ID:    serverHost.ID(),
 					Addrs: []ma.Multiaddr{serverHTTPAddr, serverHost.Addrs()[0]},
@@ -259,7 +262,7 @@ func TestRoundTrippers(t *testing.T) {
 		},
 		{
 			name: "No HTTP transport",
-			setupRoundTripper: func(t *testing.T, clientStreamHost host.Host, clientHTTPHost *libp2phttp.Host) http.RoundTripper {
+			setupRoundTripper: func(t *testing.T, _ host.Host, clientHTTPHost *libp2phttp.Host) http.RoundTripper {
 				rt, err := clientHTTPHost.NewConstrainedRoundTripper(peer.AddrInfo{
 					ID:    serverHost.ID(),
 					Addrs: []ma.Multiaddr{serverHost.Addrs()[0]},
@@ -271,7 +274,7 @@ func TestRoundTrippers(t *testing.T) {
 		},
 		{
 			name: "Stream transport first",
-			setupRoundTripper: func(t *testing.T, clientStreamHost host.Host, clientHTTPHost *libp2phttp.Host) http.RoundTripper {
+			setupRoundTripper: func(t *testing.T, _ host.Host, clientHTTPHost *libp2phttp.Host) http.RoundTripper {
 				rt, err := clientHTTPHost.NewConstrainedRoundTripper(peer.AddrInfo{
 					ID:    serverHost.ID(),
 					Addrs: []ma.Multiaddr{serverHost.Addrs()[0], serverHTTPAddr},
@@ -399,7 +402,7 @@ func TestPlainOldHTTPServer(t *testing.T) {
 		},
 		{
 			name: "using stock http client",
-			do: func(t *testing.T, request *http.Request) (*http.Response, error) {
+			do: func(_ *testing.T, request *http.Request) (*http.Response, error) {
 				request.URL.Scheme = "http"
 				request.URL.Host = l.Addr().String()
 				request.Host = l.Addr().String()
@@ -453,7 +456,7 @@ func TestHostZeroValue(t *testing.T) {
 		InsecureAllowHTTP: true,
 		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
 	}
-	server.SetHTTPHandler("/hello", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("hello")) }))
+	server.SetHTTPHandler("/hello", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("hello")) }))
 	go func() {
 		server.Serve()
 	}()
@@ -561,7 +564,7 @@ func TestCustomServeMux(t *testing.T) {
 }
 
 func TestSetHandlerAtPath(t *testing.T) {
-	hf := func(w http.ResponseWriter, r *http.Request) {
+	hf := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Add("Content-Type", "text/plain")
 		w.Write([]byte("Hello World"))
 	}
@@ -730,7 +733,7 @@ func TestResponseWriterShouldNotHaveCancelledContext(t *testing.T) {
 	defer httpHost.Close()
 
 	closeNotifyCh := make(chan bool, 1)
-	httpHost.SetHTTPHandlerAtPath("/test", "/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpHost.SetHTTPHandlerAtPath("/test", "/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// Legacy code uses this to check if the connection was closed
 		//lint:ignore SA1019 This is a test to assert we do the right thing since Go HTTP stdlib depends on this.
 		ch := w.(http.CloseNotifier).CloseNotify()
@@ -778,7 +781,7 @@ func TestHTTPHostAsRoundTripper(t *testing.T) {
 	}))
 
 	// Different protocol.ID and mounted at a different path
-	serverHttpHost.SetHTTPHandlerAtPath("/hello-again", "/hello2", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serverHttpHost.SetHTTPHandlerAtPath("/hello-again", "/hello2", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("hello"))
 	}))
 
@@ -841,22 +844,30 @@ func TestRedirects(t *testing.T) {
 	go serverHttpHost.Serve()
 	defer serverHttpHost.Close()
 
-	serverHttpHost.SetHTTPHandlerAtPath("/redirect-1/0.0.1", "/a", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serverHttpHost.SetHTTPHandlerAtPath("/redirect-1/0.0.1", "/a", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "/b/")
 		w.WriteHeader(http.StatusMovedPermanently)
 	}))
 
-	serverHttpHost.SetHTTPHandlerAtPath("/redirect-2/0.0.1", "/b", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serverHttpHost.SetHTTPHandlerAtPath("/redirect-2/0.0.1", "/b", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "/c/")
 		w.WriteHeader(http.StatusMovedPermanently)
 	}))
 
-	serverHttpHost.SetHTTPHandlerAtPath("/redirect-3/0.0.1", "/c", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serverHttpHost.SetHTTPHandlerAtPath("/redirect-3/0.0.1", "/c", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "/d/")
 		w.WriteHeader(http.StatusMovedPermanently)
 	}))
 
-	serverHttpHost.SetHTTPHandlerAtPath("/redirect-4/0.0.1", "/d", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serverHttpHost.SetHTTPHandlerAtPath("/redirect-4/0.0.1", "/d", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("hello"))
+	}))
+
+	serverHttpHost.SetHTTPHandlerAtPath("/redirect-1/0.0.1", "/foo/bar/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "../baz/")
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	serverHttpHost.SetHTTPHandlerAtPath("/redirect-1/0.0.1", "/foo/baz/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("hello"))
 	}))
 
@@ -876,9 +887,17 @@ func TestRedirects(t *testing.T) {
 			u := fmt.Sprintf("multiaddr:%s/http-path/a%%2f", a)
 			f := fmt.Sprintf("http://127.0.0.1:%s/d/", port)
 			testCases = append(testCases, testCase{u, f})
+
+			u = fmt.Sprintf("multiaddr:%s/http-path/foo%%2Fbar", a)
+			f = fmt.Sprintf("http://127.0.0.1:%s/foo/baz/", port)
+			testCases = append(testCases, testCase{u, f})
 		} else {
 			u := fmt.Sprintf("multiaddr:%s/p2p/%s/http-path/a%%2f", a, serverHost.ID())
-			f := fmt.Sprintf("multiaddr:%s/p2p/%s/http-path/%%2Fd%%2F", a, serverHost.ID())
+			f := fmt.Sprintf("multiaddr:%s/p2p/%s/http-path/d%%2F", a, serverHost.ID())
+			testCases = append(testCases, testCase{u, f})
+
+			u = fmt.Sprintf("multiaddr:%s/p2p/%s/http-path/foo%%2Fbar", a, serverHost.ID())
+			f = fmt.Sprintf("multiaddr:%s/p2p/%s/http-path/foo%%2Fbaz%%2F", a, serverHost.ID())
 			testCases = append(testCases, testCase{u, f})
 		}
 	}
@@ -926,12 +945,12 @@ func TestMultiaddrURIRedirect(t *testing.T) {
 	require.NotNil(t, streamMultiaddr)
 
 	// Redirect to a whole other transport!
-	serverHttpHost.SetHTTPHandlerAtPath("/redirect-1/0.0.1", "/a", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serverHttpHost.SetHTTPHandlerAtPath("/redirect-1/0.0.1", "/a", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", fmt.Sprintf("multiaddr:%s/p2p/%s/http-path/b", streamMultiaddr, serverHost.ID()))
 		w.WriteHeader(http.StatusMovedPermanently)
 	}))
 
-	serverHttpHost.SetHTTPHandlerAtPath("/redirect-2/0.0.1", "/b", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serverHttpHost.SetHTTPHandlerAtPath("/redirect-2/0.0.1", "/b", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -995,4 +1014,135 @@ func TestImpliedHostIsSet(t *testing.T) {
 		})
 	}
 
+}
+
+func TestErrServerClosed(t *testing.T) {
+	server := libp2phttp.Host{
+		InsecureAllowHTTP: true,
+		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		err := server.Serve()
+		assert.Equal(t, http.ErrServerClosed, err)
+		close(done)
+	}()
+
+	server.Close()
+	<-done
+}
+
+func TestHTTPOverStreamsGetClientID(t *testing.T) {
+	serverHost, err := libp2p.New(
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1"),
+	)
+	require.NoError(t, err)
+
+	httpHost := libp2phttp.Host{StreamHost: serverHost}
+
+	httpHost.SetHTTPHandler("/echo-id", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientID := libp2phttp.ClientPeerID(r)
+		w.Write([]byte(clientID.String()))
+	}))
+
+	// Start server
+	go httpHost.Serve()
+	defer httpHost.Close()
+
+	// Start client
+	clientHost, err := libp2p.New(libp2p.NoListenAddrs)
+	require.NoError(t, err)
+	clientHost.Connect(context.Background(), peer.AddrInfo{
+		ID:    serverHost.ID(),
+		Addrs: serverHost.Addrs(),
+	})
+
+	client := http.Client{
+		Transport: &libp2phttp.Host{StreamHost: clientHost},
+	}
+	require.NoError(t, err)
+
+	resp, err := client.Get("multiaddr:" + serverHost.Addrs()[0].String() + "/p2p/" + serverHost.ID().String() + "/http-path/echo-id")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	require.Equal(t, clientHost.ID().String(), string(body))
+}
+
+func TestAuthenticatedRequest(t *testing.T) {
+	serverSK, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	serverID, err := peer.IDFromPrivateKey(serverSK)
+	require.NoError(t, err)
+
+	serverStreamHost, err := libp2p.New(
+		libp2p.Identity(serverSK),
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1"),
+		libp2p.Transport(libp2pquic.NewTransport),
+	)
+	require.NoError(t, err)
+
+	server := libp2phttp.Host{
+		InsecureAllowHTTP: true,
+		StreamHost:        serverStreamHost,
+		ListenAddrs:       []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/0/http")},
+		ServerPeerIDAuth: &httpauth.ServerPeerIDAuth{
+			TokenTTL: time.Hour,
+			PrivKey:  serverSK,
+			NoTLS:    true,
+			ValidHostnameFn: func(hostname string) bool {
+				return strings.HasPrefix(hostname, "127.0.0.1")
+			},
+		},
+	}
+	server.SetHTTPHandler("/echo-id", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientID := libp2phttp.ClientPeerID(r)
+		w.Write([]byte(clientID.String()))
+	}))
+
+	go server.Serve()
+
+	clientSK, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+
+	clientStreamHost, err := libp2p.New(
+		libp2p.Identity(clientSK),
+		libp2p.NoListenAddrs,
+		libp2p.Transport(libp2pquic.NewTransport))
+	require.NoError(t, err)
+
+	client := &http.Client{
+		Transport: &libp2phttp.Host{
+			StreamHost: clientStreamHost,
+			ClientPeerIDAuth: &httpauth.ClientPeerIDAuth{
+				TokenTTL: time.Hour,
+				PrivKey:  clientSK,
+			},
+		},
+	}
+
+	clientID, err := peer.IDFromPrivateKey(clientSK)
+	require.NoError(t, err)
+
+	for _, serverAddr := range server.Addrs() {
+		_, tpt := ma.SplitLast(serverAddr)
+		t.Run(tpt.String(), func(t *testing.T) {
+			url := fmt.Sprintf("multiaddr:%s/p2p/%s/http-path/echo-id", serverAddr, serverID)
+			t.Log("Making a GET request to:", url)
+			resp, err := client.Get(url)
+			require.NoError(t, err)
+
+			observedServerID := libp2phttp.ServerPeerID(resp)
+			require.Equal(t, serverID, observedServerID)
+
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			require.Equal(t, clientID.String(), string(body))
+		})
+	}
 }

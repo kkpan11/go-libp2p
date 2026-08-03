@@ -20,7 +20,7 @@ import (
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/multiformats/go-multibase"
 	"github.com/multiformats/go-multihash"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 type connMultiaddrs struct {
@@ -33,8 +33,12 @@ func (c *connMultiaddrs) LocalMultiaddr() ma.Multiaddr  { return c.local }
 func (c *connMultiaddrs) RemoteMultiaddr() ma.Multiaddr { return c.remote }
 
 const (
-	candidateSetupTimeout         = 20 * time.Second
-	DefaultMaxInFlightConnections = 10
+	candidateSetupTimeout = 10 * time.Second
+	// This is higher than other transports(64) as there's no way to detect a peer that has gone away after
+	// sending the initial connection request message(STUN Binding request). Such peers take up a goroutine
+	// till connection timeout. As the number of handshakes in parallel is still guarded by the resource
+	// manager, this higher number is okay.
+	DefaultMaxInFlightConnections = 128
 )
 
 type listener struct {
@@ -118,7 +122,7 @@ func (l *listener) listen() {
 		candidate, err := l.mux.Accept(l.ctx)
 		if err != nil {
 			if l.ctx.Err() == nil {
-				log.Debugf("accepting candidate failed: %s", err)
+				log.Debug("accepting candidate failed", "error", err)
 			}
 			return
 		}
@@ -131,8 +135,8 @@ func (l *listener) listen() {
 
 			conn, err := l.handleCandidate(ctx, candidate)
 			if err != nil {
-				l.mux.RemoveConnByUfrag(candidate.Ufrag)
-				log.Debugf("could not accept connection: %s: %v", candidate.Ufrag, err)
+				l.mux.RemoveConnByUfrag(candidate.LocalUfrag)
+				log.Debug("could not accept connection", "ufrag", candidate.LocalUfrag, "error", err)
 				return
 			}
 
@@ -192,9 +196,15 @@ func (l *listener) setupConnection(
 		}
 	}()
 
+	// The udpmux has already parsed and validated the STUN USERNAME: LocalUfrag is
+	// the server (local) ufrag, RemoteUfrag the client ufrag, and RemotePwd the
+	// client ICE password (recovered per WebRTC Direct version). See
+	// udpmux.credentialsFromSTUNMessage.
+	serverUfrag := candidate.LocalUfrag
+
 	settingEngine := webrtc.SettingEngine{LoggerFactory: pionLoggerFactory}
 	settingEngine.SetAnsweringDTLSRole(webrtc.DTLSRoleServer)
-	settingEngine.SetICECredentials(candidate.Ufrag, candidate.Ufrag)
+	settingEngine.SetICECredentials(serverUfrag, serverUfrag)
 	settingEngine.SetLite(true)
 	settingEngine.SetICEUDPMux(l.mux)
 	settingEngine.SetIncludeLoopbackCandidate(true)
@@ -220,9 +230,11 @@ func (l *listener) setupConnection(
 	}
 
 	errC := addOnConnectionStateChangeCallback(w.PeerConnection)
-	// Infer the client SDP from the incoming STUN message by setting the ice-ufrag.
+	// Infer the client SDP offer from the incoming STUN message using the client
+	// ufrag and password. pion validates the full "server_ufrag:client_ufrag"
+	// USERNAME on inbound checks, so the remote ice-ufrag must be the client ufrag.
 	if err := w.PeerConnection.SetRemoteDescription(webrtc.SessionDescription{
-		SDP:  createClientSDP(candidate.Addr, candidate.Ufrag),
+		SDP:  createClientSDP(candidate.Addr, candidate.RemoteUfrag, candidate.RemotePwd),
 		Type: webrtc.SDPTypeOffer,
 	}); err != nil {
 		return nil, err
@@ -240,7 +252,7 @@ func (l *listener) setupConnection(
 		return nil, ctx.Err()
 	case err := <-errC:
 		if err != nil {
-			return nil, fmt.Errorf("peer connection failed for ufrag: %s", candidate.Ufrag)
+			return nil, fmt.Errorf("peer connection failed for ufrag: %s", serverUfrag)
 		}
 	}
 
@@ -249,7 +261,7 @@ func (l *listener) setupConnection(
 	if err != nil {
 		return nil, err
 	}
-	handshakeChannel := newStream(w.HandshakeDataChannel, rwc, func() {})
+	handshakeChannel := newStream(w.HandshakeDataChannel, rwc, maxSendMessageSize, nil)
 	// we do not yet know A's peer ID so accept any inbound
 	remotePubKey, err := l.transport.noiseHandshake(ctx, w.PeerConnection, handshakeChannel, "", crypto.SHA256, true)
 	if err != nil {
@@ -325,26 +337,23 @@ func (l *listener) Multiaddr() ma.Multiaddr {
 // addOnConnectionStateChangeCallback adds the OnConnectionStateChange to the PeerConnection.
 // The channel returned here:
 // * is closed when the state changes to Connection
-// * receives an error when the state changes to Failed
-// * doesn't receive anything (nor is closed) when the state changes to Disconnected
+// * receives an error when the state changes to Failed or Closed or Disconnected
 func addOnConnectionStateChangeCallback(pc *webrtc.PeerConnection) <-chan error {
 	errC := make(chan error, 1)
 	var once sync.Once
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+	pc.OnConnectionStateChange(func(_ webrtc.PeerConnectionState) {
 		switch pc.ConnectionState() {
 		case webrtc.PeerConnectionStateConnected:
 			once.Do(func() { close(errC) })
-		case webrtc.PeerConnectionStateFailed:
+		// PeerConnectionStateFailed happens when we fail to negotiate the connection.
+		// PeerConnectionStateDisconnected happens when we disconnect immediately after connecting.
+		// PeerConnectionStateClosed happens when we close the peer connection locally, not when remote closes. We don't need
+		// to error in this case, but it's a no-op, so it doesn't hurt.
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateDisconnected:
 			once.Do(func() {
 				errC <- errors.New("peerconnection failed")
 				close(errC)
 			})
-		case webrtc.PeerConnectionStateDisconnected:
-			// the connection can move to a disconnected state and back to a connected state without ICE renegotiation.
-			// This could happen when underlying UDP packets are lost, and therefore the connection moves to the disconnected state.
-			// If the connection then receives packets on the connection, it can move back to the connected state.
-			// If no packets are received until the failed timeout is triggered, the connection moves to the failed state.
-			log.Warn("peerconnection disconnected")
 		}
 	})
 	return errC
